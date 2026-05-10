@@ -310,6 +310,141 @@ class SistemDeFisiere:
         self._salveaza_pe_disc()
         print(f" -> [SUCCES] Fisierul '{nume_complet}' a fost sters cu succes.")
 
+    def comanda_rename(self, nume_vechi_complet, nume_nou_complet):
+        """
+        Executa comanda RENAME: Cauta fisierul in ROOT si ii actualizeaza
+        doar cei 11 octeti corespunzatori numelui si extensiei.
+        """
+        # 1. Prelucram numele vechi
+        if "." in nume_vechi_complet:
+            nume_vechi, ext_veche = nume_vechi_complet.split(".", 1)
+        else:
+            nume_vechi, ext_veche = nume_vechi_complet, ""
+
+        # 2. Prelucram si validam numele nou
+        if "." in nume_nou_complet:
+            nume_nou, ext_noua = nume_nou_complet.split(".", 1)
+        else:
+            nume_nou, ext_noua = nume_nou_complet, ""
+
+        if len(nume_nou) > 8 or len(ext_noua) > 3:
+            print(f" -> [WARNING] Noul nume '{nume_nou_complet}' depaseste limitele (8 nume, 3 extensie).")
+            return
+
+        # 3. Cautam fisierul vechi in ROOT
+        slot_gasit = -1
+        for i in range(self.MAX_FISIERE):
+            offset_curent = self.OFFSET_ROOT + (i * 16)
+            date_slot = self.ram_buffer[offset_curent: offset_curent + 16]
+            nume_b, ext_b, _, _, _ = struct.unpack('<8s3sHHB', date_slot)
+
+            if nume_b[0] == 0: continue
+
+            nume = nume_b.decode('utf-8').strip('\x00').strip()
+            ext = ext_b.decode('utf-8').strip('\x00').strip()
+
+            if nume == nume_vechi and ext == ext_veche:
+                slot_gasit = i
+                break
+
+        if slot_gasit == -1:
+            print(f" -> [WARNING] Fisierul sursa '{nume_vechi_complet}' nu exista.")
+            return
+
+        # 4. Pregatim noile date in format de bytes
+        nume_nou_b = nume_nou.encode('utf-8')[:8].ljust(8, b'\x00')
+        ext_noua_b = ext_noua.encode('utf-8')[:3].ljust(3, b'\x00')
+
+        # 5. Suprascriem strict zona de nume (8 octeti) si extensie (3 octeti) din ROOT
+        offset_scriere = self.OFFSET_ROOT + (slot_gasit * 16)
+        self.ram_buffer[offset_scriere: offset_scriere + 8] = nume_nou_b
+        self.ram_buffer[offset_scriere + 8: offset_scriere + 11] = ext_noua_b
+
+        # 6. Salvam pe disc
+        self._salveaza_pe_disc()
+        print(f" -> [SUCCES] Fisierul a fost redenumit in '{nume_nou_complet}'.")
+
+    def comanda_copy(self, nume_sursa_complet, nume_dest_complet):
+        """
+        Executa comanda COPY: Citeste datele fisierului sursa mergand pe
+        lantul FAT si creeaza un fisier identic pe disc.
+        """
+        # 1. Prelucram numele sursei si destinatiei
+        if "." in nume_sursa_complet:
+            nume_sursa, ext_sursa = nume_sursa_complet.split(".", 1)
+        else:
+            nume_sursa, ext_sursa = nume_sursa_complet, ""
+
+        if "." in nume_dest_complet:
+            nume_dest, ext_dest = nume_dest_complet.split(".", 1)
+        else:
+            nume_dest, ext_dest = nume_dest_complet, ""
+
+        if len(nume_dest) > 8 or len(ext_dest) > 3:
+            print(f" -> [WARNING] Numele destinatiei '{nume_dest_complet}' depaseste limitele (8.3).")
+            return
+
+        # 2. Cautam fisierul sursa in ROOT
+        slot_gasit = -1
+        marime_sursa = 0
+        prima_ua_sursa = -1
+        attr_sursa = 0
+
+        for i in range(self.MAX_FISIERE):
+            offset_curent = self.OFFSET_ROOT + (i * 16)
+            date_slot = self.ram_buffer[offset_curent: offset_curent + 16]
+            nume_b, ext_b, marime, ua_start, attr = struct.unpack('<8s3sHHB', date_slot)
+
+            if nume_b[0] == 0: continue
+
+            nume = nume_b.decode('utf-8').strip('\x00').strip()
+            ext = ext_b.decode('utf-8').strip('\x00').strip()
+
+            if nume == nume_sursa and ext == ext_sursa:
+                slot_gasit = i
+                marime_sursa = marime
+                prima_ua_sursa = ua_start
+                attr_sursa = attr
+                break
+
+        if slot_gasit == -1:
+            print(f" -> [WARNING] Fisierul sursa '{nume_sursa_complet}' nu exista.")
+            return
+
+        # 3. Citim datele fizice ale fisierului sursa navigand prin FAT
+        date_citite = bytearray()
+        ua_curenta = prima_ua_sursa
+
+        while ua_curenta != 3 and ua_curenta != 0:
+            # Extragem blocul de 16 octeti
+            offset_fizic = ua_curenta * self.UA
+            bloc_date = self.ram_buffer[offset_fizic: offset_fizic + self.UA]
+            date_citite.extend(bloc_date)
+
+            # Citim din FAT adresa urmatoarei UA
+            offset_fat = self.OFFSET_FAT + (ua_curenta * 2)
+            ua_curenta = struct.unpack('<H', self.ram_buffer[offset_fat: offset_fat + 2])[0]
+
+        # Taiem zerourile adaugate in plus (padding-ul) pentru a pastra marimea exacta
+        date_citite = date_citite[:marime_sursa]
+
+        # 4. Alocam spatiu si scriem fisierul nou
+        necesar_ua = max(1, (marime_sursa + self.UA - 1) // self.UA)
+        lista_ua_libere = self.gaseste_ua_libere(necesar_ua)
+
+        if not lista_ua_libere:
+            print(" -> [WARNING] Spatiu insuficient pe disc pentru a copia fisierul!")
+            return
+
+        # Folosim metodele deja existente pentru a construi clona
+        prima_ua_dest = self.scrie_inlantuire_fat(lista_ua_libere)
+        self.scrie_date_fisier(lista_ua_libere, date_citite)
+
+        # 5. Salvam clona in ROOT
+        rezultat = self.creeaza_intrare_root(nume_dest, ext_dest, marime_sursa, prima_ua_dest, attr_sursa)
+        if rezultat:
+            print(f" -> [SUCCES] Fisierul a fost copiat cu numele '{nume_dest_complet}'.")
+
     def porneste_sistem(self):
         """
         Verifică dacă există deja discul fizic. Dacă da, îl încarcă în RAM.
@@ -337,28 +472,33 @@ class SistemDeFisiere:
             if not input_cmd:
                 continue
 
+            # Transformam prima portiune (comanda) in majuscule
+            input_cmd[0] = input_cmd[0].upper()
+
             match input_cmd:
-                case ["exit"]:
+                case ["EXIT"]:
                     print("Sistemul se inchide...")
                     break
 
                 case ["DIR"]:
                     self.comanda_dir(detaliat=False)
 
-                case ["DIR", "-a"]:
+                # Permitem atat "dir -a" cat si "dir -A"
+                case ["DIR", "-a"] | ["DIR", "-A"]:
                     self.comanda_dir(detaliat=True)
 
                 case ["CREATE", nume_complet, dimensiune, model]:
-                    self.comanda_create(nume_complet, dimensiune, model)
+                    # Fortam si modelul (-alfa, -num) sa fie majuscule pentru comparatia din cod
+                    self.comanda_create(nume_complet, dimensiune, model.upper())
 
                 case ["DELETE", nume]:
                     self.comanda_delete(nume)
 
                 case ["RENAME", nume_vechi, nume_nou]:
-                    print(" -> [TODO] Comanda RENAME nu a fost inca implementata.")
+                    self.comanda_rename(nume_vechi, nume_nou)
 
                 case ["COPY", sursa, dest]:
-                    print(" -> [TODO] Comanda COPY nu a fost inca implementata.")
+                    self.comanda_copy(sursa, dest)
 
                 case _:
                     print(" -> [WARNING] Comanda nerecunoscuta sau argumente gresite.")
