@@ -250,6 +250,66 @@ class SistemDeFisiere:
         if rezultat:
             print(f" -> [SUCCES] Fisierul '{nume_complet}' ({dimensiune} bytes) creat cu succes!")
 
+    def comanda_delete(self, nume_complet):
+        """
+        Executa comanda DELETE: Cauta fisierul in ROOT, sterge intrarea,
+        apoi elibereaza intregul lant de unitati de alocare din tabela FAT.
+        """
+        if "." in nume_complet:
+            nume_cautat, ext_cautata = nume_complet.split(".", 1)
+        else:
+            nume_cautat, ext_cautata = nume_complet, ""
+
+        slot_gasit = -1
+        prima_ua = -1
+
+        # 1. Cautam fisierul in ROOT
+        for i in range(self.MAX_FISIERE):
+            offset_curent = self.OFFSET_ROOT + (i * 16)
+            date_slot = self.ram_buffer[offset_curent: offset_curent + 16]
+            nume_b, ext_b, marime, ua_start, attr = struct.unpack('<8s3sHHB', date_slot)
+
+            # Sarim peste sloturile deja goale
+            if nume_b[0] == 0:
+                continue
+
+            nume = nume_b.decode('utf-8').strip('\x00').strip()
+            ext = ext_b.decode('utf-8').strip('\x00').strip()
+
+            # Verificam daca am gasit fisierul cerut
+            if nume == nume_cautat and ext == ext_cautata:
+                slot_gasit = i
+                prima_ua = ua_start
+
+                # Stergem intrarea din ROOT setand primul octet pe 0
+                self.ram_buffer[offset_curent] = 0
+                break
+
+        if slot_gasit == -1:
+            print(f" -> [WARNING] Fisierul '{nume_complet}' nu a fost gasit.")
+            return
+
+        # 2. Eliberam Unitatile de Alocare din FAT
+        ua_curenta = prima_ua
+
+        # Parcurgem lantul pana dam de 3 (EOF) sau 0 (ca masura de siguranta)
+        while ua_curenta != 3 and ua_curenta != 0:
+            offset_fat = self.OFFSET_FAT + (ua_curenta * 2)
+
+            # Citim unde duce legatura mai departe
+            octeti = self.ram_buffer[offset_fat: offset_fat + 2]
+            ua_urmatoare = struct.unpack('<H', octeti)[0]
+
+            # Eliberam unitatea curenta marcand-o cu 0 in RAM
+            self.ram_buffer[offset_fat: offset_fat + 2] = struct.pack('<H', 0)
+
+            # Trecem la urmatoarea veriga din lant
+            ua_curenta = ua_urmatoare
+
+        # 3. Salvam modificarile pe discul fizic
+        self._salveaza_pe_disc()
+        print(f" -> [SUCCES] Fisierul '{nume_complet}' a fost sters cu succes.")
+
     def porneste_sistem(self):
         """
         Verifică dacă există deja discul fizic. Dacă da, îl încarcă în RAM.
@@ -292,7 +352,7 @@ class SistemDeFisiere:
                     self.comanda_create(nume_complet, dimensiune, model)
 
                 case ["DELETE", nume]:
-                    print(" -> [TODO] Comanda DELETE nu a fost inca implementata.")
+                    self.comanda_delete(nume)
 
                 case ["RENAME", nume_vechi, nume_nou]:
                     print(" -> [TODO] Comanda RENAME nu a fost inca implementata.")
